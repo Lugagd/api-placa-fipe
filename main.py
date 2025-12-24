@@ -6,7 +6,7 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 
 app = FastAPI()
 
-# Configuração do CORS para permitir acesso do seu Dashboard
+# Configuração do CORS para seu Dashboard.jsx
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,8 +16,6 @@ app.add_middleware(
 )
 
 CHROME_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
-# Mudamos para o novo site conforme solicitado
-SITE_URL = "https://www.placafipe.com"
 
 @app.get("/")
 def read_root():
@@ -27,94 +25,89 @@ def read_root():
 async def rota_consultar(placa: str):
     resultado = await consultar_placa(placa)
     if resultado.get("status") == "erro":
+        # Retorna o erro específico para o frontend
         raise HTTPException(status_code=500, detail=resultado.get("mensagem"))
     return resultado
 
 async def consultar_placa(placa: str):
     placa_limpa = placa.upper().replace("-", "").strip()
+    site_alvo = f"https://www.placafipe.com/placa/{placa_limpa}"
     
     async with async_playwright() as p:
-        # Lançamento otimizado
         browser = await p.chromium.launch(
             headless=True,
             args=[
                 "--no-sandbox", 
                 "--disable-dev-shm-usage", 
-                "--disable-setuid-sandbox",
-                "--disable-gpu", # Economiza recursos no Cloud Run
-                "--disable-blink-features=AutomationControlled"
+                "--disable-blink-features=AutomationControlled",
+                "--disable-gpu"
             ]
         )
         
         context = await browser.new_context(user_agent=CHROME_USER_AGENT)
         page = await context.new_page()
         
-        # --- ESTRATÉGIA TURBO: Bloqueio de Imagens e Anúncios ---
-        # Isso reduz o consumo de banda e acelera o carregamento em até 60%
-        await page.route("**/*.{png,jpg,jpeg,gif,svg,css,woff,otf}", lambda route: route.abort())
-
-        # Timeouts curtos para falhar rápido se o site estiver fora, mas longos o suficiente para o processamento
-        page.set_default_timeout(40000) 
+        # --- BLOQUEIO DE RECURSOS PARA VELOCIDADE ---
+        # Bloqueia CSS, Imagens e Fontes para carregar apenas o texto
+        await page.route("**/*.{png,jpg,jpeg,gif,svg,css,woff,woff2,otf}", lambda route: route.abort())
 
         try:
-            # Indo direto para a URL de busca do novo site para ganhar tempo
-            # domcontentloaded é muito mais rápido que networkidle
-            await page.goto(f"{SITE_URL}/placa/{placa_limpa}", wait_until="domcontentloaded")
+            # Vai direto para a URL da placa para evitar cliques extras
+            # Usamos 'commit' para ser o mais rápido possível
+            await page.goto(site_alvo, wait_until="commit", timeout=30000)
             
-            # Espera o elemento principal de detalhes aparecer (conforme imagem_44ccea.png)
-            # O seletor abaixo busca o container principal de informações
-            detalhes_selector = "div.container" 
-            await page.wait_for_selector(detalhes_selector, state="visible")
+            # Esperamos o texto principal que contém os detalhes
+            # O seletor 'body' é garantido, vamos buscar o conteúdo dentro dele
+            await page.wait_for_selector("body", timeout=30000)
+            
+            # Captura o texto da página para extração via Regex (mais rápido que seletores complexos)
+            texto_pagina = await page.inner_text("body")
+            
+            # Se não encontrar a placa no texto, o site provavelmente retornou erro
+            if "não encontrada" in texto_pagina.lower():
+                return {"status": "erro", "mensagem": "Placa não encontrada na base de dados."}
 
-            # Extração dos dados baseada no padrão do placafipe.com
-            content = await page.content()
-            
-            # Limpeza de dados via Regex para ser mais rápido que percorrer tabelas
-            # Buscando os campos principais que aparecem na imagem_44ccea.png
-            def extrair(campo):
-                match = re.search(rf"{campo}:?\s*</b>\s*([^<]+)", content, re.IGNORECASE)
+            # Extração dos dados usando padrões de texto do site
+            def extrair_valor(campo):
+                match = re.search(rf"{campo}:?\s*([^\n\r]+)", texto_pagina, re.IGNORECASE)
                 return match.group(1).strip() if match else "Não informado"
 
-            dados_veiculo = {
-                "Marca": extrair("Marca"),
-                "Modelo": extrair("Modelo"),
-                "Ano": extrair("Ano"),
-                "Ano Modelo": extrair("Ano Modelo"),
-                "Cor": extrair("Cor"),
-                "Cilindrada": extrair("Cilindrada"),
-                "Potência": extrair("Potência"),
-                "Combustível": extrair("Combustível"),
-                "Municipio": extrair("Município"),
-                "UF": extrair("UF")
+            detalhes = {
+                "Marca": extrair_valor("Marca"),
+                "Modelo": extrair_valor("Modelo"),
+                "Ano": extrair_valor("Ano"),
+                "Ano Modelo": extrair_valor("Ano Modelo"),
+                "Cor": extrair_valor("Cor"),
+                "Combustível": extrair_valor("Combustível"),
+                "Municipio": extrair_valor("Município"),
+                "UF": extrair_valor("UF")
             }
 
-            # Tenta pegar os valores da Tabela FIPE que ficam mais abaixo na página
+            # Tenta extrair valores FIPE se houver tabela
             valores_fipe = []
             try:
-                # Localiza linhas que contenham "R$" (valor monetário)
-                fipe_elements = await page.locator("table tr").all()
-                for el in fipe_elements:
-                    text = await el.inner_text()
-                    if "R$" in text:
-                        parts = text.split("\t")
-                        if len(parts) >= 2:
-                            valores_fipe.append({"modelo": parts[0].strip(), "valor": parts[-1].strip()})
+                # Busca por linhas que contenham "R$"
+                linhas = texto_pagina.split("\n")
+                for linha in linhas:
+                    if "R$" in linha and ("202" in linha or "201" in linha):
+                        valores_fipe.append({"info": linha.strip()})
             except:
                 pass
 
             return {
                 "placa": placa_limpa,
-                "detalhes": dados_veiculo,
-                "valores_fipe": valores_fipe,
+                "detalhes": detalhes,
+                "valores_fipe": valores_fipe[:3], # Limita aos 3 primeiros para velocidade
                 "status": "sucesso"
             }
 
+        except PlaywrightTimeoutError:
+            return {"status": "erro", "mensagem": "O site demorou muito para responder."}
         except Exception as e:
-            return {"status": "erro", "mensagem": f"Erro na consulta: {str(e)}"}
+            return {"status": "erro", "mensagem": str(e)}
         finally:
             await browser.close()
 
 if __name__ == "__main__":
     import uvicorn
-    # Mantendo a porta 8000 conforme sua configuração do Cloud Run
     uvicorn.run(app, host="0.0.0.0", port=8000)
