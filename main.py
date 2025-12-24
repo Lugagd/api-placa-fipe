@@ -6,7 +6,7 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 
 app = FastAPI()
 
-# Configuração do CORS para seu Dashboard.jsx
+# Configuração do CORS para seu Dashboard
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,6 +16,7 @@ app.add_middleware(
 )
 
 CHROME_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+SITE_BASE_URL = "https://www.placafipe.com/placa"
 
 @app.get("/")
 def read_root():
@@ -25,86 +26,86 @@ def read_root():
 async def rota_consultar(placa: str):
     resultado = await consultar_placa(placa)
     if resultado.get("status") == "erro":
-        # Retorna o erro específico para o frontend
         raise HTTPException(status_code=500, detail=resultado.get("mensagem"))
     return resultado
 
 async def consultar_placa(placa: str):
     placa_limpa = placa.upper().replace("-", "").strip()
-    site_alvo = f"https://www.placafipe.com/placa/{placa_limpa}"
+    url_final = f"{SITE_BASE_URL}/{placa_limpa}"
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox", 
-                "--disable-dev-shm-usage", 
-                "--disable-blink-features=AutomationControlled",
-                "--disable-gpu"
-            ]
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
         )
-        
         context = await browser.new_context(user_agent=CHROME_USER_AGENT)
         page = await context.new_page()
         
-        # --- BLOQUEIO DE RECURSOS PARA VELOCIDADE ---
-        # Bloqueia CSS, Imagens e Fontes para carregar apenas o texto
-        await page.route("**/*.{png,jpg,jpeg,gif,svg,css,woff,woff2,otf}", lambda route: route.abort())
+        # Bloqueio de mídia para acelerar o carregamento
+        await page.route("**/*.{png,jpg,jpeg,gif,svg,css,woff,2,otf}", lambda route: route.abort())
 
         try:
-            # Vai direto para a URL da placa para evitar cliques extras
-            # Usamos 'commit' para ser o mais rápido possível
-            await page.goto(site_alvo, wait_until="commit", timeout=30000)
+            # Navegação rápida
+            await page.goto(url_final, wait_until="domcontentloaded", timeout=30000)
             
-            # Esperamos o texto principal que contém os detalhes
-            # O seletor 'body' é garantido, vamos buscar o conteúdo dentro dele
-            await page.wait_for_selector("body", timeout=30000)
-            
-            # Captura o texto da página para extração via Regex (mais rápido que seletores complexos)
-            texto_pagina = await page.inner_text("body")
-            
-            # Se não encontrar a placa no texto, o site provavelmente retornou erro
-            if "não encontrada" in texto_pagina.lower():
-                return {"status": "erro", "mensagem": "Placa não encontrada na base de dados."}
+            # 1. Extração de Detalhes Técnicos (Usando a tabela limpa)
+            detalhes = {}
+            rows = await page.locator("table.fipe-uma-coluna tr").all()
+            for row in rows:
+                text = await row.inner_text()
+                if ":" in text:
+                    chave, valor = text.split(":", 1)
+                    detalhes[chave.strip()] = valor.strip()
 
-            # Extração dos dados usando padrões de texto do site
-            def extrair_valor(campo):
-                match = re.search(rf"{campo}:?\s*([^\n\r]+)", texto_pagina, re.IGNORECASE)
-                return match.group(1).strip() if match else "Não informado"
-
-            detalhes = {
-                "Marca": extrair_valor("Marca"),
-                "Modelo": extrair_valor("Modelo"),
-                "Ano": extrair_valor("Ano"),
-                "Ano Modelo": extrair_valor("Ano Modelo"),
-                "Cor": extrair_valor("Cor"),
-                "Combustível": extrair_valor("Combustível"),
-                "Municipio": extrair_valor("Município"),
-                "UF": extrair_valor("UF")
-            }
-
-            # Tenta extrair valores FIPE se houver tabela
+            # 2. Extração de Valores FIPE (Tabela de modelos encontrados)
             valores_fipe = []
+            fipe_rows = await page.locator("table:has-text('Código FIPE') tr").all()
+            for row in fipe_rows[1:]: # Pula cabeçalho
+                cols = await row.locator("td").all()
+                if len(cols) >= 3:
+                    valores_fipe.append({
+                        "codigo": await cols[0].inner_text(),
+                        "modelo": await cols[1].inner_text(),
+                        "valor": await cols[2].inner_text()
+                    })
+
+            # 3. Extração de IPVA e Valor Venal (Foco em SP / Último Ano)
+            ipva_info = None
             try:
-                # Busca por linhas que contenham "R$"
-                linhas = texto_pagina.split("\n")
-                for linha in linhas:
-                    if "R$" in linha and ("202" in linha or "201" in linha):
-                        valores_fipe.append({"info": linha.strip()})
+                # Localiza especificamente a tabela de histórico de IPVA
+                ipva_table_rows = await page.locator("table:has-text('Ano IPVA') tr").all()
+                if len(ipva_table_rows) > 1:
+                    # Pega a primeira linha de dados (ano mais recente)
+                    cols = await ipva_table_rows[1].locator("td").all()
+                    if len(cols) >= 3:
+                        ipva_info = {
+                            "ano": await cols[0].inner_text(),
+                            "valor_venal": await cols[1].inner_text(),
+                            "valor_ipva": await cols[2].inner_text(),
+                            "estado": "São Paulo (SP)"
+                        }
             except:
-                pass
+                pass # Caso não exista tabela de IPVA
 
             return {
                 "placa": placa_limpa,
-                "detalhes": detalhes,
-                "valores_fipe": valores_fipe[:3], # Limita aos 3 primeiros para velocidade
+                "veiculo": {
+                    "marca": detalhes.get("Marca"),
+                    "modelo": detalhes.get("Modelo"),
+                    "ano": detalhes.get("Ano"),
+                    "ano_modelo": detalhes.get("Ano Modelo"),
+                    "cor": detalhes.get("Cor"),
+                    "municipio": detalhes.get("Município"),
+                    "uf": detalhes.get("UF"),
+                    "chassi": detalhes.get("Chassi")
+                },
+                "fipe": valores_fipe,
+                "ipva_sp": ipva_info,
                 "status": "sucesso"
             }
 
-        except PlaywrightTimeoutError:
-            return {"status": "erro", "mensagem": "O site demorou muito para responder."}
         except Exception as e:
-            return {"status": "erro", "mensagem": str(e)}
+            return {"status": "erro", "mensagem": f"Erro na extração: {str(e)}"}
         finally:
             await browser.close()
 
