@@ -39,14 +39,14 @@ async def consultar_placa(placa: str):
             await page.goto(SITE_URL, timeout=60000, wait_until="domcontentloaded")
           
             input_selector = 'input[type="text"]'
-            await page.wait_for_selector(input_selector, state='visible', timeout=10000)
+            await page.wait_for_selector(input_selector, state='visible', timeout=200)
             await page.fill(input_selector, placa)
       
             button_selector = 'button:has-text("Pesquisa")'
             await page.click(button_selector)
 
             tabela_selector = 'table.fipeTablePriceDetail'
-            await page.wait_for_selector(tabela_selector, timeout=20000)
+            await page.wait_for_selector(tabela_selector, timeout=200)
             
             dados_extraidos = {}
             rows = await page.locator(f'{tabela_selector} tr').all()
