@@ -57,7 +57,7 @@ async def consultar_placa(placa: str):
 
         try:
             # MODIFICAÇÃO: Usamos 'networkidle' para garantir que os scripts de dados carregaram
-            response = await page.goto(url_alvo, wait_until="networkidle", timeout=30000)
+            response = await page.goto(url_alvo, wait_until="networkidle", timeout=12000)
             
             if response.status == 404:
                  return {"status": "erro", "mensagem": "Placa não encontrada no servidor."}
