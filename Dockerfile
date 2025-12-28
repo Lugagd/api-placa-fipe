@@ -1,4 +1,3 @@
-@@ -1,18 +1,32 @@
 FROM python:3.11-slim-bookworm
 
 # Instala dependências do sistema corrigidas para Debian Bookworm
