@@ -6,6 +6,7 @@ from playwright.async_api import async_playwright
 
 app = FastAPI()
 
+# Configuração de CORS para o seu Dashboard
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,90 +18,118 @@ app.add_middleware(
 CHROME_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 BASE_URL = "https://placafipe.com/placa"
 
-# Variável global para manter o browser aberto entre requisições (Warm Start)
-playwright_instance = None
-browser_instance = None
-
-async def get_browser():
-    global playwright_instance, browser_instance
-    if not browser_instance:
-        playwright_instance = await async_playwright().start()
-        browser_instance = await playwright_instance.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox", 
-                "--disable-dev-shm-usage", 
-                "--disable-gpu",
-                "--disable-setuid-sandbox",
-                "--no-first-run",
-                "--no-zygote",
-                "--single-process" # Melhora performance em containers pequenos
-            ]
-        )
-    return browser_instance
+@app.get("/")
+def read_root():
+    return {"message": "API de Placas Online - Estabilizada"}
 
 @app.get("/consultar/{placa}")
 async def rota_consultar(placa: str):
-    browser = await get_browser()
-    # Criamos um novo contexto por aba para isolar cookies/cache
-    context = await browser.new_context(user_agent=CHROME_USER_AGENT)
-    page = await context.new_page()
+    resultado = await consultar_placa(placa)
+    if resultado.get("status") == "erro":
+        # Se for erro de placa não encontrada, retorna 404
+        if "não encontrada" in resultado.get("mensagem").lower():
+             raise HTTPException(status_code=404, detail=resultado.get("mensagem"))
+        # Outros erros retornam 500
+        raise HTTPException(status_code=500, detail=resultado.get("mensagem"))
+    return resultado
 
-    # BLOQUEIO AGRESSIVO DE ANÚNCIOS E SCRIPTS LENTOS
-    async def block_agressive(route):
-        url = route.request.url.lower()
-        bad_words = ["google-analytics", "doubleclick", "facebook", "fontawesome", "adsbygoogle", "adservice"]
-        if any(word in url for word in bad_words) or url.endswith((".png", ".jpg", ".gif", ".woff", ".woff2")):
-            return await route.abort()
-        return await route.continue_()
+async def consultar_placa(placa: str):
+    placa_limpa = placa.upper().replace("-", "").strip()
+    url_alvo = f"{BASE_URL}/{placa_limpa}"
+    
+    async with async_playwright() as p:
+        # Abrimos o browser aqui para garantir que cada requisição tenha seu processo limpo
+        # Isso evita o erro 'Uncaught signal: 5' que você viu nos logs
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+        )
+        
+        context = await browser.new_context(
+            user_agent=CHROME_USER_AGENT,
+            viewport={'width': 1280, 'height': 720}
+        )
+        page = await context.new_page()
 
-    await page.route("**/*", block_agressive)
+        # BLOQUEIO DE RECURSOS: Acelera muito o carregamento sem parecer bot
+        async def block_resources(route):
+            url = route.request.url.lower()
+            # Bloqueia anúncios e rastreadores que pesam a página
+            bad_domains = ["google", "ads", "analytics", "facebook", "doubleclick"]
+            if any(domain in url for domain in bad_domains) or route.request.resource_type in ["image", "font", "media"]:
+                return await route.abort()
+            return await route.continue_()
 
-    try:
-        placa_limpa = placa.upper().replace("-", "").strip()
-        # Navegação 'commit' é a mais rápida possível
-        await page.goto(f"{BASE_URL}/{placa_limpa}", wait_until="commit", timeout=15000)
+        await page.route("**/*", block_resources)
 
-        # Espera curta por um elemento que prova que o conteúdo carregou
         try:
-            await page.wait_for_selector("table.fipeTablePriceDetail", timeout=7000)
-        except:
+            # wait_until="domcontentloaded" é o equilíbrio perfeito entre velocidade e dados prontos
+            await page.goto(url_alvo, wait_until="domcontentloaded", timeout=25000)
+
+            # Verifica se a placa existe usando um seletor rápido
             if await page.query_selector("text='Placa não encontrada'"):
                 return {"status": "erro", "mensagem": "Placa não encontrada."}
-            return {"status": "erro", "mensagem": "Erro de carregamento rápido."}
 
-        # EXTRAÇÃO DE DADOS (Otimizada com evaluate para rodar direto no JS do browser)
-        dados = await page.evaluate("""() => {
-            const extrairTabela = (selector) => {
-                const rows = document.querySelectorAll(`${selector} tr`);
-                return Array.from(rows).map(row => {
-                    const cols = row.querySelectorAll('td');
-                    return Array.from(cols).map(c => c.innerText.trim());
+            # Aguarda o elemento vital da tabela
+            try:
+                await page.wait_for_selector("table.fipeTablePriceDetail", timeout=8000)
+            except:
+                return {"status": "erro", "mensagem": "Timeout ao localizar dados do veículo."}
+
+            # EXTRAÇÃO OTIMIZADA: Executamos um único script JS dentro do navegador
+            # Isso é MUITO mais rápido do que múltiplos 'await page.locator'
+            dados = await page.evaluate("""() => {
+                const getTableData = (selector) => {
+                    const rows = document.querySelectorAll(`${selector} tr`);
+                    return Array.from(rows).map(r => {
+                        const cols = r.querySelectorAll('td');
+                        return Array.from(cols).map(c => c.innerText.trim());
+                    });
+                };
+
+                // Detalhes Técnicos
+                const tecnicos = {};
+                getTableData('table.fipeTablePriceDetail').forEach(row => {
+                    if(row.length === 2) tecnicos[row[0].replace(':','').trim()] = row[1];
                 });
-            };
 
-            const detalhesRaw = extrairTabela('table.fipeTablePriceDetail');
-            const detalhes = {};
-            detalhesRaw.forEach(r => { if(r.length === 2) detalhes[r[0].replace(':','')] = r[1]; });
+                // Tabela Fipe
+                const fipeRaw = getTableData('table.fipe-desktop').length > 0 
+                    ? getTableData('table.fipe-desktop') 
+                    : getTableData('table.fipe-mobile');
+                
+                const fipe = fipeRaw.filter(r => r.length >= 3).map(r => ({
+                    codigo: r[0], modelo: r[1], valor: r[2]
+                }));
 
-            const fipeRaw = extrairTabela('table.fipe-desktop') || extrairTabela('table.fipe-mobile');
-            const fipe = fipeRaw.filter(r => r.length >= 3).map(r => ({ codigo: r[0], modelo: r[1], valor: r[2] }));
+                // Histórico IPVA (SP)
+                const ipvaRows = Array.from(document.querySelectorAll("table:has-text('Ano IPVA') tr"));
+                const ipva = ipvaRows.slice(1).map(r => {
+                    const c = r.querySelectorAll('td');
+                    if(c.length >= 3) {
+                        return { ano: c[0].innerText.trim(), valor_venal: c[1].innerText.trim(), valor_ipva: c[2].innerText.trim() };
+                    }
+                    return null;
+                }).filter(x => x && !isNaN(x.ano));
 
-            return { veiculo: detalhes, fipe: fipe };
-        }""")
+                return { veiculo: tecnicos, fipe, historico_ipva: ipva };
+            }""")
 
-        return {
-            "placa": placa_limpa,
-            "veiculo": dados['veiculo'],
-            "fipe": dados['fipe'],
-            "status": "sucesso"
-        }
+            return {
+                "placa": placa_limpa,
+                "veiculo": dados['veiculo'],
+                "fipe": dados['fipe'],
+                "historico_ipva": dados['historico_ipva'],
+                "status": "sucesso"
+            }
 
-    except Exception as e:
-        return {"status": "erro", "mensagem": str(e)}
-    finally:
-        await context.close() # Fecha apenas a aba, mantém o browser vivo
+        except Exception as e:
+            return {"status": "erro", "mensagem": f"Falha na extração: {str(e)}"}
+        finally:
+            # Crucial: fecha o browser para liberar os 2GB de RAM para a próxima chamada
+            await browser.close()
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
