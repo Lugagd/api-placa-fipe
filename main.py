@@ -3,74 +3,95 @@ import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import async_playwright
+# Instale: pip install fake-useragent
+from fake_useragent import UserAgent
 
 app = FastAPI()
 
-# Configuração de CORS para o seu Dashboard
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# User-Agent atualizado para evitar detecção básica
-CHROME_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 BASE_URL = "https://placafipe.com/placa"
-
-@app.get("/")
-def read_root():
-    return {"message": "API de Placas Online - Rodando no Cloud Run"}
 
 @app.get("/consultar/{placa}")
 async def rota_consultar(placa: str):
-    resultado = await consultar_placa(placa)
-    if resultado.get("status") == "erro":
-        # Retorna 404 se a placa não existir, facilitando o tratamento no Front
-        if "não encontrada" in resultado.get("mensagem").lower():
-             raise HTTPException(status_code=404, detail=resultado.get("mensagem"))
-        raise HTTPException(status_code=500, detail=resultado.get("mensagem"))
-    return resultado
+    # Retry logic simples: tenta 2 vezes antes de falhar
+    for tentativa in range(2):
+        try:
+            resultado = await consultar_placa(placa)
+            if resultado.get("status") == "erro":
+                if "não encontrada" in resultado.get("mensagem").lower():
+                    raise HTTPException(status_code=404, detail=resultado.get("mensagem"))
+                # Se for outro erro e for a última tentativa
+                if tentativa == 1:
+                    raise HTTPException(status_code=500, detail=resultado.get("mensagem"))
+                continue # Tenta de novo
+            return resultado
+        except Exception as e:
+            if tentativa == 1:
+                raise HTTPException(status_code=500, detail=str(e))
+            await asyncio.sleep(1) # Espera 1s antes de tentar de novo
 
 async def consultar_placa(placa: str):
     placa_limpa = placa.upper().replace("-", "").strip()
     url_alvo = f"{BASE_URL}/{placa_limpa}"
+    ua = UserAgent()
     
     async with async_playwright() as p:
-        # Lançamento otimizado
         browser = await p.chromium.launch(
             headless=True, 
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+            args=[
+                "--no-sandbox", 
+                "--disable-dev-shm-usage", 
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled", # Esconde que é automação
+                "--disable-extensions",
+                "--mute-audio"
+            ]
         )
         
-        # Define um viewport padrão para simular um navegador real
         context = await browser.new_context(
-            user_agent=CHROME_USER_AGENT,
-            viewport={'width': 1280, 'height': 720}
+            user_agent=ua.random, # User agent aleatório
+            viewport={'width': 1366, 'height': 768},
+            locale='pt-BR',
+            timezone_id='America/Sao_Paulo'
         )
+
+        # Script poderoso para esconder o WebDriver
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.navigator.chrome = { runtime: {} };
+        """)
+        
         page = await context.new_page()
         
-        # MODIFICAÇÃO: Bloqueia apenas mídias pesadas. 
-        # Mantemos CSS e JS para garantir que a tabela seja montada corretamente.
-        await page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,otf}", lambda route: route.abort())
+        # Bloqueio agressivo de recursos inúteis para acelerar e economizar banda
+        await page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,otf,css}", lambda route: route.abort())
+        # Opcional: Bloquear Google Ads/Analytics se souber os domínios
 
         try:
-            # MODIFICAÇÃO: Usamos 'networkidle' para garantir que os scripts de dados carregaram
-            response = await page.goto(url_alvo, wait_until="networkidle", timeout=12000)
+            # Usar domcontentloaded é mais rápido e menos propenso a timeout que networkidle
+            response = await page.goto(url_alvo, wait_until="domcontentloaded", timeout=25000)
             
             if response.status == 404:
                  return {"status": "erro", "mensagem": "Placa não encontrada no servidor."}
 
-            # MODIFICAÇÃO: Aguarda explicitamente o seletor da tabela principal aparecer
+            # Espera inteligente
             try:
-                await page.wait_for_selector("table.fipeTablePriceDetail", timeout=8000)
+                await page.wait_for_selector("table.fipeTablePriceDetail", timeout=10000)
             except:
-                if await page.query_selector("text='Placa não encontrada'"):
+                content = await page.content()
+                if "Placa não encontrada" in content:
                     return {"status": "erro", "mensagem": "Placa não encontrada."}
-                return {"status": "erro", "mensagem": "Timeout: O site demorou a responder ou bloqueou a conexão."}
+                if "Access Denied" in content or "403 Forbidden" in content:
+                     return {"status": "erro", "mensagem": "Bloqueio de IP detectado."}
+                return {"status": "erro", "mensagem": "Timeout ao buscar tabela."}
 
-            # 1. Extração de Detalhes Técnicos
+            # --- EXTRAÇÃO (SEU CÓDIGO ORIGINAL ABAIXO) ---
             detalhes = {}
             rows = await page.locator("table.fipeTablePriceDetail tr").all()
             for row in rows:
@@ -80,9 +101,7 @@ async def consultar_placa(placa: str):
                     valor = (await cols[1].inner_text()).strip()
                     detalhes[chave] = valor
 
-            # 2. Extração de Valores FIPE
             valores_fipe = []
-            # Tenta desktop, se não houver, tenta mobile
             fipe_rows = await page.locator("table.fipe-desktop tr").all()
             if not fipe_rows:
                 fipe_rows = await page.locator("table.fipe-mobile tr").all()
@@ -96,7 +115,6 @@ async def consultar_placa(placa: str):
                         "valor": (await cols[2].inner_text()).strip()
                     })
 
-            # 3. Extração do Histórico de IPVA
             historico_ipva = []
             ipva_rows = await page.locator("table:has-text('Ano IPVA') tr").all()
             
@@ -120,11 +138,6 @@ async def consultar_placa(placa: str):
             }
 
         except Exception as e:
-            return {"status": "erro", "mensagem": f"Falha na extração: {str(e)}"}
+            return {"status": "erro", "mensagem": f"Erro interno: {str(e)}"}
         finally:
             await browser.close()
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
