@@ -13,122 +13,103 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+# 1. Estado Inicial
 CHROME_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 BASE_URL = "https://placafipe.com/placa"
 
-playwright_manager = None
-browser_instance = None
-
-async def get_browser():
-    """Mantém uma instância única do navegador aberta para economizar tempo de boot."""
-    global playwright_manager, browser_instance
-    if browser_instance is None:
-        playwright_manager = await async_playwright().start()
-        browser_instance = await playwright_manager.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox", 
-                "--disable-dev-shm-usage", 
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled" 
-            ]
-        )
-    return browser_instance
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Fecha o navegador quando a API desliga."""
-    if browser_instance:
-        await browser_instance.close()
-    if playwright_manager:
-        await playwright_manager.stop()
-
 @app.get("/")
 def read_root():
-    return {"message": "API Otimizada - Cloud Run"}
+    return {"message": "API de Placas Online - Rodando no Cloud Run"}
 
 @app.get("/consultar/{placa}")
 async def rota_consultar(placa: str):
     resultado = await consultar_placa(placa)
     if resultado.get("status") == "erro":
-        status_code = 404 if "não encontrada" in resultado.get("mensagem").lower() else 500
-        raise HTTPException(status_code=status_code, detail=resultado.get("mensagem"))
+        if "não encontrada" in resultado.get("mensagem").lower():
+             raise HTTPException(status_code=404, detail=resultado.get("mensagem"))
+        raise HTTPException(status_code=500, detail=resultado.get("mensagem"))
     return resultado
 
 async def consultar_placa(placa: str):
     placa_limpa = placa.upper().replace("-", "").strip()
     url_alvo = f"{BASE_URL}/{placa_limpa}"
     
-    browser = await get_browser()
-    
-    context = await browser.new_context(
-        user_agent=CHROME_USER_AGENT,
-        viewport={'width': 1280, 'height': 720}
-    )
-    page = await context.new_page()
-
-    await page.route("**/*", lambda route: 
-        route.abort() if route.request.resource_type in ["image", "media", "font", "stylesheet"] 
-        else route.continue_()
-    )
-
-    try:
-        response = await page.goto(url_alvo, wait_until="domcontentloaded", timeout=15000)
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True, 
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+        )
         
-        if response and response.status == 404:
-            return {"status": "erro", "mensagem": "Placa não encontrada no servidor."}
+        context = await browser.new_context(
+            user_agent=CHROME_USER_AGENT,
+            viewport={'width': 1280, 'height': 720}
+        )
+        page = await context.new_page()
+        
+        await page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,otf}", lambda route: route.abort())
 
         try:
-            await page.wait_for_selector("table.fipeTablePriceDetail", timeout=6000)
-        except:
-            if await page.query_selector("text='Placa não encontrada'"):
-                return {"status": "erro", "mensagem": "Placa não encontrada."}
-            return {"status": "erro", "mensagem": "Timeout ou bloqueio pelo site."}
+            response = await page.goto(url_alvo, wait_until="networkidle", timeout=12000)
+            
+            if response.status == 404:
+                 return {"status": "erro", "mensagem": "Placa não encontrada no servidor."}
 
-        dados = await page.evaluate("""() => {
-            const extrairTabela = (selector) => {
-                const rows = document.querySelectorAll(`${selector} tr`);
-                let obj = {};
-                rows.forEach(row => {
-                    const cols = row.querySelectorAll('td');
-                    if (cols.length >= 2) {
-                        const chave = cols[0].innerText.replace(':', '').trim();
-                        obj[chave] = cols[1].innerText.trim();
-                    }
-                });
-                return obj;
-            };
+            try:
+                await page.wait_for_selector("table.fipeTablePriceDetail", timeout=8000)
+            except:
+                if await page.query_selector("text='Placa não encontrada'"):
+                    return {"status": "erro", "mensagem": "Placa não encontrada."}
+                return {"status": "erro", "mensagem": "Timeout: O site demorou a responder ou bloqueou a conexão."}
 
-            const extrairFipe = () => {
-                const rows = document.querySelectorAll('table.fipe-desktop tr, table.fipe-mobile tr');
-                return Array.from(rows).slice(1).map(row => {
-                    const cols = row.querySelectorAll('td');
-                    return cols.length >= 3 ? {
-                        codigo: cols[0].innerText.trim(),
-                        modelo: cols[1].innerText.trim(),
-                        valor: cols[2].innerText.trim()
-                    } : null;
-                }).filter(x => x);
-            };
+            detalhes = {}
+            rows = await page.locator("table.fipeTablePriceDetail tr").all()
+            for row in rows:
+                cols = await row.locator("td").all()
+                if len(cols) == 2:
+                    chave = (await cols[0].inner_text()).replace(":", "").strip()
+                    valor = (await cols[1].inner_text()).strip()
+                    detalhes[chave] = valor
+
+            valores_fipe = []
+            fipe_rows = await page.locator("table.fipe-desktop tr").all()
+            if not fipe_rows:
+                fipe_rows = await page.locator("table.fipe-mobile tr").all()
+            
+            for row in fipe_rows:
+                cols = await row.locator("td").all()
+                if len(cols) >= 3:
+                    valores_fipe.append({
+                        "codigo": (await cols[0].inner_text()).strip(),
+                        "modelo": (await cols[1].inner_text()).strip(),
+                        "valor": (await cols[2].inner_text()).strip()
+                    })
+
+            historico_ipva = []
+            ipva_rows = await page.locator("table:has-text('Ano IPVA') tr").all()
+            
+            for row in ipva_rows:
+                cols = await row.locator("td").all()
+                if len(cols) >= 3:
+                    ano = (await cols[0].inner_text()).strip()
+                    if ano.isdigit():
+                        historico_ipva.append({
+                            "ano": ano,
+                            "valor_venal": (await cols[1].inner_text()).strip(),
+                            "valor_ipva": (await cols[2].inner_text()).strip()
+                        })
 
             return {
-                veiculo: extrairTabela('table.fipeTablePriceDetail'),
-                fipe: extrairFipe()
-            };
-        }""")
+                "placa": placa_limpa,
+                "veiculo": detalhes,
+                "fipe": valores_fipe,
+                "historico_ipva": historico_ipva,
+                "status": "sucesso"
+            }
 
-        return {
-            "placa": placa_limpa,
-            "veiculo": dados["veiculo"],
-            "fipe": dados["fipe"],
-            "status": "sucesso"
-        }
-
-    except Exception as e:
-        return {"status": "erro", "mensagem": f"Erro: {str(e)}"}
-    finally:
-        await context.close()
+        except Exception as e:
+            return {"status": "erro", "mensagem": f"Falha na extração: {str(e)}"}
+        finally:
+            await browser.close()
 
 if __name__ == "__main__":
     import uvicorn
