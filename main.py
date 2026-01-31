@@ -17,151 +17,128 @@ app.add_middleware(
 CHROME_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 BASE_URL = "https://placafipe.com/placa"
 
-playwright_instance = None
-browser_instance = None
+class BrowserManager:
+    def __init__(self):
+        self.playwright = None
+        self.browser = None
+        self.lock = asyncio.Lock() # Evita que duas requisições tentem criar o browser ao mesmo tempo
+
+    async def get_browser(self):
+        async with self.lock:
+            if not self.browser or not self.browser.is_connected():
+                if self.playwright:
+                    try: await self.playwright.stop()
+                    except: pass
+                
+                self.playwright = await async_playwright().start()
+                self.browser = await self.playwright.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox", 
+                        "--disable-dev-shm-usage", 
+                        "--disable-gpu",
+                        "--disable-setuid-sandbox"
+                    ]
+                )
+            return self.browser
+
+    async def close(self):
+        if self.browser:
+            await self.browser.close()
+        if self.playwright:
+            await self.playwright.stop()
+
+browser_manager = BrowserManager()
 
 @app.on_event("startup")
 async def startup_event():
-    global playwright_instance, browser_instance
-    playwright_instance = await async_playwright().start()
-    browser_instance = await playwright_instance.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox", 
-            "--disable-dev-shm-usage", 
-            "--disable-gpu",
-            "--disable-setuid-sandbox",
-            "--no-first-run",
-            "--no-zygote",
-            "--single-process" 
-        ]
-    )
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    if browser_instance:
-        await browser_instance.close()
-    if playwright_instance:
-        await playwright_instance.stop()
-
-@app.get("/")
-def read_root():
-    return {"message": "API de Placas Online - Ultra Fast Mode"}
+    # Pré-aquece o browser no início
+    try:
+        await browser_manager.get_browser()
+    except Exception as e:
+        print(f"Erro ao iniciar browser no startup: {e}")
 
 @app.get("/consultar/{placa}")
 async def rota_consultar(placa: str):
-    resultado = await consultar_placa(placa)
+    placa_limpa = placa.upper().replace("-", "").strip()
+    if not placa_limpa:
+        raise HTTPException(status_code=400, detail="Placa inválida")
+
+    # Tenta a consulta
+    resultado = await consultar_placa(placa_limpa)
+    
     if resultado.get("status") == "erro":
-        status_code = 404 if "não encontrada" in resultado.get("mensagem").lower() else 500
-        raise HTTPException(status_code=status_code, detail=resultado.get("mensagem"))
+        msg = resultado.get("mensagem", "")
+        if "não encontrada" in msg.lower():
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=500, detail=msg)
+    
     return resultado
 
 async def consultar_placa(placa: str):
-    placa_limpa = placa.upper().replace("-", "").strip()
-    url_alvo = f"{BASE_URL}/{placa_limpa}"
+    url_alvo = f"{BASE_URL}/{placa}"
     
-    context = await browser_instance.new_context(
-        user_agent=CHROME_USER_AGENT,
-        viewport={'width': 800, 'height': 600} 
-    )
-    page = await context.new_page()
-
-    await page.route("**/*", lambda route: route.abort() 
-        if route.request.resource_type in ["image", "media", "font", "stylesheet", "script", "other"] 
-        else route.continue_()
-    )
-
     try:
-        response = await page.goto(url_alvo, wait_until="domcontentloaded", timeout=7000)
+        browser = await browser_manager.get_browser()
+        # Contexto isolado para não misturar cookies/cache de buscas diferentes
+        context = await browser.new_context(user_agent=CHROME_USER_AGENT)
+        page = await context.new_page()
+
+        # Bloqueio de tudo que não é essencial para o texto
+        await page.route("**/*.{png,jpg,jpeg,gif,svg,css,woff,woff2,otf}", lambda route: route.abort())
+
+        # Vai para a página - domcontentloaded é o gatilho mais rápido
+        response = await page.goto(url_alvo, wait_until="domcontentloaded", timeout=12000)
         
         if response.status == 404:
-            return {"status": "erro", "mensagem": "Placa não encontrada no servidor."}
+            await context.close()
+            return {"status": "erro", "mensagem": "Placa não encontrada."}
 
+        # Aguarda o elemento chave ou mensagem de erro
         try:
-            await page.wait_for_selector("table.fipeTablePriceDetail", timeout=5000)
+            await page.wait_for_selector("table.fipeTablePriceDetail", timeout=6000)
         except:
-            return {"status": "erro", "mensagem": "Placa não encontrada ou bloqueio de conexão."}
+            # Se não achou a tabela, checa se tem texto de erro na tela
+            corpo = await page.content()
+            if "não encontrada" in corpo.lower():
+                await context.close()
+                return {"status": "erro", "mensagem": "Placa não encontrada."}
+            await context.close()
+            return {"status": "erro", "mensagem": "Timeout ou Bloqueio pelo site."}
 
+        # EXTRAÇÃO ULTRA-FAST VIA JS
         dados = await page.evaluate("""() => {
-            const extrairTabelaSimples = (selector) => {
-                const rows = document.querySelectorAll(selector + " tr");
-                const obj = {};
-                rows.forEach(row => {
-                    const cols = row.querySelectorAll("td");
-                    if(cols.length >= 2) {
-                        const chave = cols[0].innerText.replace(":", "").trim();
-                        obj[chave] = cols[1].innerText.trim();
-                    }
+            const getTabela = (sel) => {
+                const res = {};
+                document.querySelectorAll(sel + " tr").forEach(r => {
+                    const c = r.querySelectorAll("td");
+                    if(c.length >= 2) res[c[0].innerText.replace(':','').trim()] = c[1].innerText.trim();
                 });
-                return obj;
+                return res;
             };
 
-            const extrairTabelaFipe = () => {
-                const rows = document.querySelectorAll("table.fipe-desktop tr, table.fipe-mobile tr");
-                const lista = [];
-                rows.forEach(row => {
-                    const cols = row.querySelectorAll("td");
-                    if(cols.length >= 3) {
-                        lista.append({
-                            codigo: cols[0].innerText.trim(),
-                            modelo: cols[1].innerText.trim(),
-                            valor: cols[2].innerText.trim()
-                        });
-                    }
-                });
-                return lista;
+            const getFipe = () => {
+                return Array.from(document.querySelectorAll("table.fipe-desktop tr, table.fipe-mobile tr"))
+                    .map(r => {
+                        const c = r.querySelectorAll("td");
+                        return c.length >= 3 ? {codigo: c[0].innerText.trim(), modelo: c[1].innerText.trim(), valor: c[2].innerText.trim()} : null;
+                    }).filter(x => x);
             };
 
-            const extrairIPVA = () => {
-                const tables = Array.from(document.querySelectorAll("table"));
-                const ipvaTable = tables.find(t => t.innerText.includes("Ano IPVA"));
-                if (!ipvaTable) return [];
-                
-                return Array.from(ipvaTable.querySelectorAll("tr"))
-                    .slice(1) // Pula o cabeçalho
-                    .map(row => {
-                        const cols = row.querySelectorAll("td");
-                        if(cols.length >= 3) {
-                            return {
-                                ano: cols[0].innerText.trim(),
-                                valor_venal: cols[1].innerText.trim(),
-                                valor_ipva: cols[2].innerText.trim()
-                            };
-                        }
-                        return null;
-                    }).filter(i => i && !isNaN(i.ano));
-            };
-
-            return {
-                veiculo: extrairTabelaSimples("table.fipeTablePriceDetail"),
-                fipe: Array.from(document.querySelectorAll("table.fipe-desktop tr, table.fipe-mobile tr"))
-                    .map(row => {
-                        const cols = row.querySelectorAll("td");
-                        return cols.length >= 3 ? {
-                            codigo: cols[0].innerText.trim(),
-                            modelo: cols[1].innerText.trim(),
-                            valor: cols[2].innerText.trim()
-                        } : null;
-                    }).filter(x => x),
-                historico_ipva: extrairIPVA()
-            };
+            return { veiculo: getTabela("table.fipeTablePriceDetail"), fipe: getFipe() };
         }""")
 
+        await context.close()
         return {
-            "placa": placa_limpa,
+            "placa": placa,
             "veiculo": dados["veiculo"],
             "fipe": dados["fipe"],
-            "historico_ipva": dados["historico_ipva"],
             "status": "sucesso"
         }
 
     except Exception as e:
-        return {"status": "erro", "mensagem": f"Falha na extração: {str(e)}"}
-    finally:
-        await page.close()
-        await context.close()
+        return {"status": "erro", "mensagem": f"Falha interna: {str(e)}"}
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
