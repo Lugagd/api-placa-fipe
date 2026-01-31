@@ -13,103 +13,153 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# 1. Estado Inicial
+
 CHROME_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 BASE_URL = "https://placafipe.com/placa"
 
+playwright_instance = None
+browser_instance = None
+
+@app.on_event("startup")
+async def startup_event():
+    global playwright_instance, browser_instance
+    playwright_instance = await async_playwright().start()
+    browser_instance = await playwright_instance.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox", 
+            "--disable-dev-shm-usage", 
+            "--disable-gpu",
+            "--disable-setuid-sandbox",
+            "--no-first-run",
+            "--no-zygote",
+            "--single-process" 
+        ]
+    )
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if browser_instance:
+        await browser_instance.close()
+    if playwright_instance:
+        await playwright_instance.stop()
+
 @app.get("/")
 def read_root():
-    return {"message": "API de Placas Online - Rodando no Cloud Run"}
+    return {"message": "API de Placas Online - Ultra Fast Mode"}
 
 @app.get("/consultar/{placa}")
 async def rota_consultar(placa: str):
     resultado = await consultar_placa(placa)
     if resultado.get("status") == "erro":
-        if "não encontrada" in resultado.get("mensagem").lower():
-             raise HTTPException(status_code=404, detail=resultado.get("mensagem"))
-        raise HTTPException(status_code=500, detail=resultado.get("mensagem"))
+        status_code = 404 if "não encontrada" in resultado.get("mensagem").lower() else 500
+        raise HTTPException(status_code=status_code, detail=resultado.get("mensagem"))
     return resultado
 
 async def consultar_placa(placa: str):
     placa_limpa = placa.upper().replace("-", "").strip()
     url_alvo = f"{BASE_URL}/{placa_limpa}"
     
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True, 
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
-        )
+    context = await browser_instance.new_context(
+        user_agent=CHROME_USER_AGENT,
+        viewport={'width': 800, 'height': 600} 
+    )
+    page = await context.new_page()
+
+    await page.route("**/*", lambda route: route.abort() 
+        if route.request.resource_type in ["image", "media", "font", "stylesheet", "script", "other"] 
+        else route.continue_()
+    )
+
+    try:
+        response = await page.goto(url_alvo, wait_until="domcontentloaded", timeout=7000)
         
-        context = await browser.new_context(
-            user_agent=CHROME_USER_AGENT,
-            viewport={'width': 1280, 'height': 720}
-        )
-        page = await context.new_page()
-        
-        await page.route("**/*.{png,jpg,jpeg,gif,svg,woff,woff2,otf}", lambda route: route.abort())
+        if response.status == 404:
+            return {"status": "erro", "mensagem": "Placa não encontrada no servidor."}
 
         try:
-            response = await page.goto(url_alvo, wait_until="networkidle", timeout=12000)
-            
-            if response.status == 404:
-                 return {"status": "erro", "mensagem": "Placa não encontrada no servidor."}
+            await page.wait_for_selector("table.fipeTablePriceDetail", timeout=5000)
+        except:
+            return {"status": "erro", "mensagem": "Placa não encontrada ou bloqueio de conexão."}
 
-            try:
-                await page.wait_for_selector("table.fipeTablePriceDetail", timeout=8000)
-            except:
-                if await page.query_selector("text='Placa não encontrada'"):
-                    return {"status": "erro", "mensagem": "Placa não encontrada."}
-                return {"status": "erro", "mensagem": "Timeout: O site demorou a responder ou bloqueou a conexão."}
+        dados = await page.evaluate("""() => {
+            const extrairTabelaSimples = (selector) => {
+                const rows = document.querySelectorAll(selector + " tr");
+                const obj = {};
+                rows.forEach(row => {
+                    const cols = row.querySelectorAll("td");
+                    if(cols.length >= 2) {
+                        const chave = cols[0].innerText.replace(":", "").trim();
+                        obj[chave] = cols[1].innerText.trim();
+                    }
+                });
+                return obj;
+            };
 
-            detalhes = {}
-            rows = await page.locator("table.fipeTablePriceDetail tr").all()
-            for row in rows:
-                cols = await row.locator("td").all()
-                if len(cols) == 2:
-                    chave = (await cols[0].inner_text()).replace(":", "").strip()
-                    valor = (await cols[1].inner_text()).strip()
-                    detalhes[chave] = valor
+            const extrairTabelaFipe = () => {
+                const rows = document.querySelectorAll("table.fipe-desktop tr, table.fipe-mobile tr");
+                const lista = [];
+                rows.forEach(row => {
+                    const cols = row.querySelectorAll("td");
+                    if(cols.length >= 3) {
+                        lista.append({
+                            codigo: cols[0].innerText.trim(),
+                            modelo: cols[1].innerText.trim(),
+                            valor: cols[2].innerText.trim()
+                        });
+                    }
+                });
+                return lista;
+            };
 
-            valores_fipe = []
-            fipe_rows = await page.locator("table.fipe-desktop tr").all()
-            if not fipe_rows:
-                fipe_rows = await page.locator("table.fipe-mobile tr").all()
-            
-            for row in fipe_rows:
-                cols = await row.locator("td").all()
-                if len(cols) >= 3:
-                    valores_fipe.append({
-                        "codigo": (await cols[0].inner_text()).strip(),
-                        "modelo": (await cols[1].inner_text()).strip(),
-                        "valor": (await cols[2].inner_text()).strip()
-                    })
-
-            historico_ipva = []
-            ipva_rows = await page.locator("table:has-text('Ano IPVA') tr").all()
-            
-            for row in ipva_rows:
-                cols = await row.locator("td").all()
-                if len(cols) >= 3:
-                    ano = (await cols[0].inner_text()).strip()
-                    if ano.isdigit():
-                        historico_ipva.append({
-                            "ano": ano,
-                            "valor_venal": (await cols[1].inner_text()).strip(),
-                            "valor_ipva": (await cols[2].inner_text()).strip()
-                        })
+            const extrairIPVA = () => {
+                const tables = Array.from(document.querySelectorAll("table"));
+                const ipvaTable = tables.find(t => t.innerText.includes("Ano IPVA"));
+                if (!ipvaTable) return [];
+                
+                return Array.from(ipvaTable.querySelectorAll("tr"))
+                    .slice(1) // Pula o cabeçalho
+                    .map(row => {
+                        const cols = row.querySelectorAll("td");
+                        if(cols.length >= 3) {
+                            return {
+                                ano: cols[0].innerText.trim(),
+                                valor_venal: cols[1].innerText.trim(),
+                                valor_ipva: cols[2].innerText.trim()
+                            };
+                        }
+                        return null;
+                    }).filter(i => i && !isNaN(i.ano));
+            };
 
             return {
-                "placa": placa_limpa,
-                "veiculo": detalhes,
-                "fipe": valores_fipe,
-                "historico_ipva": historico_ipva,
-                "status": "sucesso"
-            }
+                veiculo: extrairTabelaSimples("table.fipeTablePriceDetail"),
+                fipe: Array.from(document.querySelectorAll("table.fipe-desktop tr, table.fipe-mobile tr"))
+                    .map(row => {
+                        const cols = row.querySelectorAll("td");
+                        return cols.length >= 3 ? {
+                            codigo: cols[0].innerText.trim(),
+                            modelo: cols[1].innerText.trim(),
+                            valor: cols[2].innerText.trim()
+                        } : null;
+                    }).filter(x => x),
+                historico_ipva: extrairIPVA()
+            };
+        }""")
 
-        except Exception as e:
-            return {"status": "erro", "mensagem": f"Falha na extração: {str(e)}"}
-        finally:
-            await browser.close()
+        return {
+            "placa": placa_limpa,
+            "veiculo": dados["veiculo"],
+            "fipe": dados["fipe"],
+            "historico_ipva": dados["historico_ipva"],
+            "status": "sucesso"
+        }
+
+    except Exception as e:
+        return {"status": "erro", "mensagem": f"Falha na extração: {str(e)}"}
+    finally:
+        await page.close()
+        await context.close()
 
 if __name__ == "__main__":
     import uvicorn
